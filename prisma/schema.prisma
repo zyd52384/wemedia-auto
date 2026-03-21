@@ -1,0 +1,64 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model Article {
+  id          String    @id @default(cuid())
+  keyword     String
+  slug        String    @unique
+  title       String
+  summary     String?
+  author      String    @default("我是老朱")
+  filePath    String
+  coverPath   String?
+  humanized   Boolean   @default(false)
+  writerStyle String    @default("general") // 'general' or 'tech'
+  status      String    @default("draft")
+  errorMsg    String?
+  publishedAt DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  taskId String?
+  task   ScheduledTask? @relation(fields: [taskId], references: [id])
+}
+
+model ScheduledTask {
+  id           String    @id @default(cuid())
+  name         String
+  keywords     String
+  cronExpr     String
+  useHumanizer Boolean   @default(false)
+  enabled      Boolean   @default(true)
+  lastRunAt    DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  articles Article[]
+}
+
+model Setting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model XhsNote {
+  id          String   @id @default(cuid())
+  keyword     String
+  slug        String   @unique
+  title       String
+  summary     String?
+  theme       String   @default("default")
+  mode        String   @default("auto-split")
+  filePath    String
+  images      String   // JSON string of image paths array
+  status      String   @default("draft")
+  errorMsg    String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
