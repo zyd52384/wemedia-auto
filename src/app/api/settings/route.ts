@@ -1,17 +1,19 @@
-import { NextRequest, NextResponse } from 'next/server';
+import { NextResponse } from 'next/server';
 import prisma from '@/lib/db';
 import fs from 'fs';
 import path from 'path';
 
-export const dynamic = 'force-dynamic';
-
-// All configurable setting keys with defaults
+// 所有合法的设置字段及其默认值（未知字段会被忽略）
 const SETTING_DEFAULTS: Record<string, string> = {
     geminiKey: '',
     geminiBaseUrl: '',
     glmApiKey: '',
     glmBaseUrl: '',
-    author: '我是老朱',
+    // 阿里百炼
+    bailianApiKey: '',
+    bailianTextModel: 'qwen-plus',
+    bailianImageModel: 'wanx-v1',
+    author: '作者未设置',
     chromePath: 'D:\\Program Files\\GptChrome\\GptBrowser.exe',
     theme: 'grace',
     writerStyle: 'general',
@@ -22,104 +24,109 @@ const SETTING_DEFAULTS: Record<string, string> = {
     xhsCookie: '',
 };
 
+// 需要掩码展示的敏感字段（不将真实值返回前端）
+const SENSITIVE_KEYS = new Set([
+    'wechatAppSecret',
+    'dashscopeKey',
+    'glmApiKey',
+    'bailianApiKey',
+    'xhsCookie',
+]);
+
+// 需要防止误覆盖的掩码值
+const MASK = '••••••••';
+
+/** 将关键配置同步写入 EXTEND.md（供外部脚本读取） */
+async function syncExtendMd(settings: Record<string, string>) {
+    try {
+        const extendPath = path.resolve(process.cwd(), 'EXTEND.md');
+        const lines = [
+            `# 自动生成的扩展配置 — ${new Date().toISOString()}`,
+            '',
+            `theme: ${settings.theme || 'grace'}`,
+            `publishMethod: ${settings.publishMethod || 'browser'}`,
+            `author: ${settings.author || '未设置'}`,
+            `chromePath: ${settings.chromePath || ''}`,
+        ];
+        fs.writeFileSync(extendPath, lines.join('\n'), 'utf-8');
+    } catch {
+        // 非致命，忽略
+    }
+}
+
 export async function GET() {
     try {
         const rows = await prisma.setting.findMany();
-        const settings: Record<string, string> = { ...SETTING_DEFAULTS };
+        const raw: Record<string, string> = {};
         for (const row of rows) {
-            settings[row.key] = row.value;
+            raw[row.key] = row.value;
         }
-        // Never expose full secret to frontend, just indicate if set
-        const maskedSettings = {
-            ...settings,
-            wechatAppSecret: settings.wechatAppSecret ? '••••••••' : '',
-            dashscopeKey: settings.dashscopeKey ? '••••••••' : '',
-            glmApiKey: settings.glmApiKey ? '••••••••' : '',
-            // For xhsCookie, don't send the actual value to frontend (it's very long)
-            // instead send empty string + a flag indicating it's been configured
-            xhsCookie: '',
-            xhsCookieSet: settings.xhsCookie ? 'true' : 'false',
-        };
-        return NextResponse.json({ settings: maskedSettings });
-    } catch (error) {
-        console.error('[settings] GET error:', error);
-        return NextResponse.json({ settings: SETTING_DEFAULTS });
+
+        // 构建返回对象，敏感字段掩码
+        const result: Record<string, string> = {};
+        for (const key of Object.keys(SETTING_DEFAULTS)) {
+            const val = raw[key] || '';
+            if (SENSITIVE_KEYS.has(key) && val) {
+                result[key] = MASK;
+                // 额外返回一个 "<key>Set" = 'true' 标记，前端可以据此显示"已配置"提示
+                result[`${key}Set`] = 'true';
+            } else {
+                result[key] = val;
+            }
+        }
+
+        // xhsCookie 单独处理（textarea 需要特殊标记）
+        result['xhsCookieSet'] = raw['xhsCookie'] ? 'true' : 'false';
+        result['xhsCookie'] = '';  // 始终不返回 cookie 明文
+
+        return NextResponse.json({ settings: result });
+    } catch (e) {
+        console.error('[api/settings GET]', e);
+        return NextResponse.json({ error: 'Failed to load settings' }, { status: 500 });
     }
 }
 
-export async function POST(request: NextRequest) {
+export async function POST(req: Request) {
     try {
-        const body = await request.json();
+        const body = await req.json();
         const { settings } = body as { settings: Record<string, string> };
 
         if (!settings || typeof settings !== 'object') {
-            return NextResponse.json({ error: '无效的设置数据' }, { status: 400 });
+            return NextResponse.json({ error: 'Invalid settings payload' }, { status: 400 });
         }
 
-        // Upsert each setting
+        const updates: Array<{ key: string; value: string }> = [];
+
         for (const [key, value] of Object.entries(settings)) {
+            // 只处理已知字段
             if (!(key in SETTING_DEFAULTS)) continue;
-            if (key === 'wechatAppSecret' && value === '••••••••') continue;
-            if (key === 'dashscopeKey' && value === '••••••••') continue;
-            if (key === 'glmApiKey' && value === '••••••••') continue;
-            if (key === 'xhsCookie' && value === '••••••••') continue;
-
-            await prisma.setting.upsert({
-                where: { key },
-                update: { value },
-                create: { key, value },
-            });
+            // 敏感字段：如果前端传来的是掩码，跳过更新（避免覆盖真实值）
+            if (SENSITIVE_KEYS.has(key) && value === MASK) continue;
+            // 空值也允许保存（相当于清除配置）
+            updates.push({ key, value: String(value) });
         }
 
-        // Sync to EXTEND.md
-        syncExtendMd(settings);
-
-        return NextResponse.json({ success: true });
-    } catch (error) {
-        console.error('[settings] POST error:', error);
-        return NextResponse.json(
-            { error: error instanceof Error ? error.message : '保存失败' },
-            { status: 500 }
+        // 批量 upsert
+        await Promise.all(
+            updates.map(({ key, value }) =>
+                prisma.setting.upsert({
+                    where: { key },
+                    update: { value },
+                    create: { key, value },
+                })
+            )
         );
-    }
-}
 
-/**
- * Sync relevant settings to .baoyu-skills/baoyu-post-to-wechat/EXTEND.md
- * so that the external skill scripts also pick up the config.
- */
-function syncExtendMd(settings: Record<string, string>) {
-    try {
-        // Try project-level first, then workspace root
-        const possiblePaths = [
-            path.resolve(process.cwd(), '.baoyu-skills', 'baoyu-post-to-wechat', 'EXTEND.md'),
-            path.resolve(process.cwd(), '..', '.baoyu-skills', 'baoyu-post-to-wechat', 'EXTEND.md'),
-        ];
-
-        let extendPath = '';
-        for (const p of possiblePaths) {
-            if (fs.existsSync(p)) { extendPath = p; break; }
+        // 同步 EXTEND.md
+        const allSettings: Record<string, string> = {};
+        for (const { key, value } of updates) {
+            allSettings[key] = value;
         }
-        if (!extendPath) {
-            // Create at workspace root level
-            extendPath = possiblePaths[1];
-            fs.mkdirSync(path.dirname(extendPath), { recursive: true });
-        }
+        await syncExtendMd(allSettings);
 
-        const lines: string[] = [];
-        lines.push(`default_theme: ${settings.theme || 'grace'}`);
-        lines.push(`default_publish_method: ${settings.publishMethod || 'browser'}`);
-        lines.push(`default_author: ${settings.author || '我是老朱'}`);
-        lines.push(`need_open_comment: 1`);
-        lines.push(`only_fans_can_comment: 0`);
-        if (settings.chromePath) {
-            lines.push(`chrome_profile_path: ${settings.chromePath}`);
-        }
-        lines.push('');
-
-        fs.writeFileSync(extendPath, lines.join('\n'), 'utf-8');
-        console.log(`[settings] EXTEND.md synced to: ${extendPath}`);
+        return NextResponse.json({ ok: true });
     } catch (e) {
-        console.warn('[settings] Failed to sync EXTEND.md:', e);
+        console.error('[api/settings POST]', e);
+        return NextResponse.json({ error: 'Failed to save settings' }, { status: 500 });
     }
 }
