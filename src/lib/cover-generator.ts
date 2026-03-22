@@ -1,336 +1,235 @@
-import { exec } from 'child_process';
-import { promisify } from 'util';
-import path from 'path';
 import fs from 'fs';
+import path from 'path';
 import { loadSettings } from './settings';
-import { translateForImagePrompt } from './gemini';
+import { translateForImagePromptWithBailian } from './bailian';
 
-const execAsync = promisify(exec);
+const BAILIAN_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+
+// 封面图默认尺寸（微信公众号推荐 900x383，小红书 1080x1350）
+const DEFAULT_COVER_SIZE = '900x383';
 
 /**
- * Generate a cover image for a WeChat article.
- * 
- * Strategy (in order):
- * 1. baoyu-image-gen skill (official Google API, uses GEMINI_API_KEY / GOOGLE_API_KEY)
- * 2. baoyu-danger-gemini-web skill (reverse-engineered Gemini Web API)
- * 3. Fallback: SVG gradient cover
+ * 调用阿里百炼图像生成 API（OpenAI images/generations 兼容接口）
+ * 支持模型：wanx-v1、wanx-v2、wanx2.5-t2i-turbo 等
+ */
+async function generateImageWithBailian(
+    prompt: string,
+    outputDir: string,
+    size: string = DEFAULT_COVER_SIZE
+): Promise<string | null> {
+    const settings = await loadSettings();
+    const apiKey = settings.bailianApiKey || process.env.BAILIAN_API_KEY || process.env.DASHSCOPE_API_KEY || '';
+    if (!apiKey) {
+        console.log('[bailian-cover] API Key 未配置，跳过百炼图片生成');
+        return null;
+    }
+
+    const imageModel = settings.bailianImageModel || 'wanx-v1';
+    console.log(`[bailian-cover] Generating cover with model: ${imageModel}, size: ${size}`);
+
+    const response = await fetch(`${BAILIAN_BASE_URL}/images/generations`, {
+        method: 'POST',
+        headers: {
+            'Authorization': `Bearer ${apiKey}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model: imageModel,
+            prompt,
+            size,
+            n: 1,
+        }),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        throw new Error(`百炼图片生成 API error ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json() as {
+        data?: Array<{ url?: string; b64_json?: string }>;
+        error?: { message?: string };
+    };
+
+    if (data.error) {
+        throw new Error(`百炼图片生成 error: ${data.error.message}`);
+    }
+
+    const imageData = data.data?.[0];
+    if (!imageData) {
+        throw new Error('百炼图片生成返回空结果');
+    }
+
+    const coverPath = path.join(outputDir, 'cover.jpg');
+
+    if (imageData.b64_json) {
+        // base64 直接写入
+        fs.writeFileSync(coverPath, Buffer.from(imageData.b64_json, 'base64'));
+        console.log(`[bailian-cover] ✅ Cover saved from base64: ${coverPath}`);
+        return coverPath;
+    }
+
+    if (imageData.url) {
+        // 下载图片 URL
+        const imgResponse = await fetch(imageData.url);
+        if (!imgResponse.ok) {
+            throw new Error(`图片下载失败: ${imgResponse.status}`);
+        }
+        const buffer = Buffer.from(await imgResponse.arrayBuffer());
+        fs.writeFileSync(coverPath, buffer);
+        console.log(`[bailian-cover] ✅ Cover downloaded from URL: ${coverPath}`);
+        return coverPath;
+    }
+
+    throw new Error('百炼图片生成：未返回 url 或 b64_json');
+}
+
+/**
+ * 构建图片生成提示词（中文标题 → 英文视觉描述）
+ */
+async function buildCoverPrompt(title: string, summary: string): Promise<string> {
+    // 优先用百炼翻译，生成英文视觉提示词
+    const translated = await translateForImagePromptWithBailian(title, summary).catch(() => null);
+
+    const topic = translated?.englishTopic || title;
+
+    return `Professional article cover image for WeChat public account.
+Theme: ${topic}.
+Style: Modern, clean, cinematic photography, shallow depth of field, bokeh background.
+Composition: Rule of thirds, horizontal landscape orientation, NO text, NO people, NO logos.
+Color palette: Rich, vibrant, harmonious tones matching the theme.
+Quality: High resolution, photorealistic.`;
+}
+
+/**
+ * SVG 渐变封面（终极兜底方案）
+ */
+function generateSvgCover(title: string): string {
+    const colors = [
+        ['#667eea', '#764ba2'],
+        ['#f093fb', '#f5576c'],
+        ['#4facfe', '#00f2fe'],
+        ['#43e97b', '#38f9d7'],
+        ['#fa709a', '#fee140'],
+        ['#a18cd1', '#fbc2eb'],
+        ['#ffecd2', '#fcb69f'],
+    ];
+    const [c1, c2] = colors[Math.abs(title.length) % colors.length];
+    const shortTitle = title.slice(0, 20);
+
+    return `<svg xmlns="http://www.w3.org/2000/svg" width="900" height="383" viewBox="0 0 900 383">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:${c1}"/>
+      <stop offset="100%" style="stop-color:${c2}"/>
+    </linearGradient>
+  </defs>
+  <rect width="900" height="383" fill="url(#bg)" rx="12"/>
+  <text x="450" y="200" font-family="PingFang SC, Microsoft YaHei, sans-serif" font-size="36"
+        font-weight="600" fill="rgba(255,255,255,0.95)" text-anchor="middle"
+        dominant-baseline="middle">${shortTitle}</text>
+</svg>`;
+}
+
+/**
+ * 主函数：生成文章封面图片
+ * 优先级：阿里百炼图片生成 → 外部脚本 → SVG 兜底
  */
 export async function generateCover(
     title: string,
     summary: string,
     outputDir: string
-): Promise<string> {
-    const coverPath = path.join(outputDir, 'cover.png');
+): Promise<string | null> {
+    fs.mkdirSync(outputDir, { recursive: true });
 
-    let englishTitle = 'Visual conceptual art';
-    let englishTopic = 'Abstract visualization of the article content';
+    // 1. 尝试百炼图片生成
     try {
-        const translated = await translateForImagePrompt(title, summary);
-        englishTitle = translated.englishTitle;
-        englishTopic = translated.englishTopic;
+        const prompt = await buildCoverPrompt(title, summary);
+        console.log(`[cover] Trying 阿里百炼图片生成...`);
+        const bailianCover = await generateImageWithBailian(prompt, outputDir);
+        if (bailianCover) {
+            console.log(`[cover] ✅ 百炼封面生成成功: ${bailianCover}`);
+            return bailianCover;
+        }
     } catch (e) {
-        console.warn('[cover] Failed to translate inputs to English. Using fallback concepts.', e);
-    }
-
-    // Build the prompt based on baoyu-cover-image 5-dimension framework
-    const prompt = buildCoverPrompt(title, summary, englishTitle, englishTopic);
-
-    // Save prompt for reference
-    const promptDir = path.join(outputDir, 'prompts');
-    fs.mkdirSync(promptDir, { recursive: true });
-    fs.writeFileSync(path.join(promptDir, 'cover-prompt.md'), prompt, 'utf-8');
-
-    // Strategy 1: baoyu-image-gen (official API) with model fallback
-    const imageGenDir = findSkillDir('baoyu-image-gen');
-    if (imageGenDir) {
-        console.log('[cover] Trying baoyu-image-gen skill...');
-        const scriptPath = path.join(imageGenDir, 'scripts', 'main.ts');
-
-        // Load API key from DB settings first, then fall back to .env
-        const settings = await loadSettings();
-        const apiKey = settings.geminiKey || process.env.GEMINI_API_KEY || '';
-        const baseUrl = settings.geminiBaseUrl || process.env.GEMINI_BASE_URL || '';
-        const env = { ...process.env };
-        if (apiKey) {
-            env.GEMINI_API_KEY = apiKey;
-            if (!env.GOOGLE_API_KEY) {
-                env.GOOGLE_API_KEY = apiKey;
-            }
-        }
-
-        // Forward base URL for the reverse proxy
-        if (baseUrl) {
-            env.GEMINI_BASE_URL = baseUrl;
-            if (!env.GOOGLE_BASE_URL) {
-                env.GOOGLE_BASE_URL = baseUrl;
-            }
-        }
-
-        // Add DashScope API Key
-        const dashscopeKey = settings.dashscopeKey || process.env.DASHSCOPE_API_KEY || '';
-        if (dashscopeKey) {
-            env.DASHSCOPE_API_KEY = dashscopeKey;
-        }
-
-        // Build list of models to try
-        const fallbacks: Array<{ model: string, provider: string }> = [];
-
-        // If Google API key exists, add Google models first
-        if (env.GEMINI_API_KEY || env.GOOGLE_API_KEY) {
-            fallbacks.push(
-                { model: 'gemini-3-pro-image', provider: 'google' },
-                { model: 'gemini-3-pro-image-preview', provider: 'google' },
-                { model: 'gemini-3-flash-preview', provider: 'google' },
-                { model: 'imagen-3.0-generate-002', provider: 'google' }
-            );
-        }
-
-        // If DashScope API key exists, add Ali model as fallback
-        if (env.DASHSCOPE_API_KEY) {
-            fallbacks.push(
-                { model: 'z-image-turbo', provider: 'dashscope' }
-            );
-        }
-
-        if (fallbacks.length === 0) {
-            console.warn('[cover] No API keys configured for image generation (Google/DashScope).');
-        }
-
-        for (const { model, provider } of fallbacks) {
-            try {
-                console.log(`[cover] Trying provider: ${provider}, model: ${model}`);
-                let sizeArgs = '--ar 2.35:1 --quality 2k';
-                if (provider === 'dashscope') {
-                    // DashScope maximum allowed size is 2048x2048. 2048 / 2.35 = 871
-                    sizeArgs = '--size 2048x871';
-                }
-                const cmd = `npx -y bun "${scriptPath}" --prompt "${escapeShell(prompt)}" --image "${coverPath}" ${sizeArgs} --model ${model} --provider ${provider}`;
-
-                await execAsync(cmd, {
-                    cwd: outputDir,
-                    timeout: 120000,
-                    env,
-                });
-
-                if (fs.existsSync(coverPath)) {
-                    console.log(`[cover] ✅ Cover generated via baoyu-image-gen (${model})`);
-                    return coverPath;
-                }
-            } catch (e: any) {
-                const errMsg = e.message || '';
-                const stderr = e.stderr || '';
-                console.warn(`[cover] Model ${model} failed:\n${errMsg.substring(0, 200)}...\n${stderr.substring(0, 500)}`);
-                const isRateLimit = errMsg.includes('429') || errMsg.includes('Too Many Requests') || errMsg.includes('RESOURCE_EXHAUSTED') || errMsg.includes('quota') || stderr.includes('429') || stderr.includes('quota');
-                if (isRateLimit) {
-                    console.warn('[cover] Rate limited. Waiting 15s before trying next model...');
-                    await new Promise(r => setTimeout(r, 15000));
-                } else {
-                    // Brief pause between model attempts to avoid overwhelming the proxy
-                    await new Promise(r => setTimeout(r, 5000));
-                }
-                continue;
-            }
-        }
-        console.warn('[cover] All image models failed');
-    }
-
-    // Strategy 2: baoyu-danger-gemini-web (reverse-engineered API)
-    const geminiWebDir = findSkillDir('baoyu-danger-gemini-web');
-    if (geminiWebDir) {
-        try {
-            console.log('[cover] Trying baoyu-danger-gemini-web skill...');
-            const scriptPath = path.join(geminiWebDir, 'scripts', 'main.ts');
-
-            const cmd = `npx -y bun "${scriptPath}" --prompt "${escapeShell(prompt)}" --image "${coverPath}"`;
-
-            await execAsync(cmd, {
-                cwd: outputDir,
-                timeout: 120000,
-                env: process.env,
-            });
-
-            if (fs.existsSync(coverPath)) {
-                console.log('[cover] ✅ Cover generated via baoyu-danger-gemini-web');
-                return coverPath;
-            }
-        } catch (e) {
-            console.warn('[cover] baoyu-danger-gemini-web failed:', (e as Error).message);
+        const errMsg = (e as Error).message;
+        console.warn(`[cover] 百炼图片生成失败: ${errMsg}`);
+        if (errMsg.includes('429') || errMsg.includes('Too Many Requests')) {
+            console.warn('[cover] Rate limited, waiting 15s...');
+            await new Promise(r => setTimeout(r, 15000));
         }
     }
 
-    // Strategy 3: Fallback SVG cover
-    console.log('[cover] Using SVG fallback cover');
+    // 2. 尝试外部技能脚本（原有的 baoyu-image-gen 等）
+    try {
+        const skillCover = await tryExternalSkillCover(title, summary, outputDir);
+        if (skillCover) {
+            console.log(`[cover] ✅ 外部技能封面生成成功: ${skillCover}`);
+            return skillCover;
+        }
+    } catch (e) {
+        console.warn(`[cover] 外部技能封面生成失败:`, (e as Error).message);
+    }
+
+    // 3. SVG 兜底
+    console.warn('[cover] 所有图片生成方案失败，使用 SVG 渐变封面');
     const svgCover = generateSvgCover(title);
-    // Save as SVG (browsers can display it, WeChat may need PNG conversion)
     const svgPath = path.join(outputDir, 'cover.svg');
     fs.writeFileSync(svgPath, svgCover);
-    fs.writeFileSync(coverPath, svgCover); // Also save as cover.png path for consistency
+    console.log(`[cover] SVG cover saved: ${svgPath}`);
     return svgPath;
 }
 
-function findSkillDir(skillName: string): string | null {
-    const possiblePaths = [
-        // Project-level skills
-        path.resolve(process.cwd(), '..', '.agents', 'skills', skillName),
-        path.resolve(process.cwd(), '.agents', 'skills', skillName),
-        path.resolve(process.cwd(), '..', '.agent', 'skills', skillName),
-        path.resolve(process.cwd(), '.agent', 'skills', skillName),
+/**
+ * 尝试通过外部技能脚本生成封面（兼容原有的 baoyu-image-gen 等方案）
+ */
+async function tryExternalSkillCover(
+    title: string,
+    summary: string,
+    outputDir: string
+): Promise<string | null> {
+    const { exec } = await import('child_process');
+    const util = await import('util');
+    const execAsync = util.promisify(exec);
+
+    const settings = await loadSettings();
+    const apiKey = settings.geminiKey || process.env.GEMINI_API_KEY || '';
+    const baseUrl = settings.geminiBaseUrl || process.env.GEMINI_BASE_URL || '';
+
+    // 查找技能脚本路径
+    const possibleSkillDirs = [
+        path.resolve(process.cwd(), '..', '.agents', 'skills', 'baoyu-image-gen'),
+        path.resolve(process.cwd(), '..', '.baoyu-skills', 'baoyu-xhs-images'),
+        path.resolve(process.cwd(), '..', '.codebuddy', 'skills', 'baoyu-image-gen'),
     ];
-    for (const p of possiblePaths) {
-        if (fs.existsSync(path.join(p, 'SKILL.md'))) {
-            console.log(`[cover] Found skill ${skillName} at: ${p}`);
-            return p;
+
+    for (const skillDir of possibleSkillDirs) {
+        const scriptPath = path.join(skillDir, 'scripts', 'main.ts');
+        if (!fs.existsSync(scriptPath)) continue;
+
+        const coverPath = path.join(outputDir, 'cover.jpg');
+        const prompt = `Professional WeChat article cover: ${title}. ${summary}. No text, no people.`;
+        const escPrompt = prompt.replace(/"/g, '\\"');
+
+        const env: Record<string, string> = { ...process.env as Record<string, string> };
+        if (apiKey) {
+            env.GEMINI_API_KEY = apiKey;
+            env.GOOGLE_API_KEY = env.GOOGLE_API_KEY || apiKey;
+        }
+        if (settings.bailianApiKey) {
+            env.DASHSCOPE_API_KEY = settings.bailianApiKey;
+        }
+        if (baseUrl) env.GEMINI_BASE_URL = baseUrl;
+
+        const cmd = `npx -y bun "${scriptPath}" --prompt "${escPrompt}" --image "${coverPath}" --width 900 --height 383`;
+
+        try {
+            await execAsync(cmd, { cwd: outputDir, timeout: 120000, env });
+            if (fs.existsSync(coverPath)) return coverPath;
+        } catch {
+            // 继续尝试下一个技能目录
         }
     }
+
     return null;
-}
-
-function buildCoverPrompt(title: string, summary: string, englishTitle: string, englishTopic: string): string {
-    // Dynamic color palette based on article topic (match on original Chinese text)
-    const palette = pickColorPalette(title, summary);
-
-    return `Create a stunning, cinematic photograph.
-
-Visual scene: A highly detailed, purely visual and text-free scene illustrating: ${englishTopic}
-
-Requirements:
-- Style: High-end editorial photography, cinematic lighting, shallow depth of field, bokeh background
-- Color palette: ${palette.name} — ${palette.description}
-- Composition: Cinematic 2.35:1 widescreen, rule of thirds, clean and empty area for future text overlay
-- Subject: Focus strictly on the environment and atmosphere, NO human faces, NO words
-- Lighting: Golden hour / soft diffused / dramatic rim lighting depending on mood
-- Mood: ${palette.mood}
-- Typography: ZERO letters, ZERO words, ZERO characters, ZERO text. The image must be completely TEXT-FREE.
-- Quality: Ultra high resolution, sharp details, professional color grading`;
-}
-
-interface ColorPalette {
-    name: string;
-    description: string;
-    mood: string;
-    gradient: [string, string, string]; // for SVG fallback
-}
-
-function pickColorPalette(title: string, summary: string): ColorPalette {
-    const text = (title + ' ' + summary).toLowerCase();
-
-    const palettes: Array<{ keywords: string[]; palette: ColorPalette }> = [
-        {
-            keywords: ['ai', '人工智能', '科技', '技术', '编程', '代码', '程序', '算法', '机器', '数字', '互联网', '计算机'],
-            palette: {
-                name: 'Cyber Blue',
-                description: 'deep navy (#0A1628), electric blue (#2563EB), cyan glow (#06B6D4), with subtle purple accent',
-                mood: 'Futuristic, cutting-edge, intelligent',
-                gradient: ['#0A1628', '#2563EB', '#06B6D4'],
-            },
-        },
-        {
-            keywords: ['职场', '工作', '管理', '效率', '商业', '创业', '赚钱', '收入', '财富', '投资', '经济'],
-            palette: {
-                name: 'Executive Gold',
-                description: 'charcoal (#1C1917), warm gold (#D97706), amber (#F59E0B), cream highlights',
-                mood: 'Authoritative, premium, prosperous',
-                gradient: ['#1C1917', '#D97706', '#F59E0B'],
-            },
-        },
-        {
-            keywords: ['健康', '养生', '医疗', '身体', '运动', '饮食', '睡眠', '心理', '情绪', '压力'],
-            palette: {
-                name: 'Vitality Green',
-                description: 'forest (#064E3B), emerald (#059669), mint (#34D399), with warm sunlight tones',
-                mood: 'Fresh, rejuvenating, natural',
-                gradient: ['#064E3B', '#059669', '#34D399'],
-            },
-        },
-        {
-            keywords: ['教育', '学习', '知识', '读书', '思维', '成长', '认知', '能力', '技能', '培训'],
-            palette: {
-                name: 'Scholar Indigo',
-                description: 'deep indigo (#312E81), royal purple (#6366F1), soft violet (#A78BFA), with paper-white accents',
-                mood: 'Intellectual, inspiring, enlightening',
-                gradient: ['#312E81', '#6366F1', '#A78BFA'],
-            },
-        },
-        {
-            keywords: ['生活', '家庭', '幸福', '爱', '婚姻', '育儿', '孩子', '父母', '陪伴', '温暖'],
-            palette: {
-                name: 'Warm Sunset',
-                description: 'deep rose (#9F1239), coral (#FB7185), peach (#FECDD3), golden hour warmth',
-                mood: 'Warm, heartfelt, comforting',
-                gradient: ['#9F1239', '#FB7185', '#FECDD3'],
-            },
-        },
-        {
-            keywords: ['中年', '人生', '岁月', '回忆', '感悟', '哲学', '时间', '选择', '命运'],
-            palette: {
-                name: 'Twilight Amber',
-                description: 'deep teal (#134E4A), warm amber (#B45309), soft copper (#D4A574), twilight blue accents',
-                mood: 'Contemplative, wise, serene depth',
-                gradient: ['#134E4A', '#B45309', '#D4A574'],
-            },
-        },
-        {
-            keywords: ['社交', '沟通', '人脉', '关系', '合作', '团队', '领导'],
-            palette: {
-                name: 'Social Coral',
-                description: 'midnight blue (#1E3A5F), vibrant coral (#FF6B6B), soft peach (#FFE0D6), warm white',
-                mood: 'Engaging, dynamic, connected',
-                gradient: ['#1E3A5F', '#FF6B6B', '#FFE0D6'],
-            },
-        },
-    ];
-
-    // Match keywords
-    for (const { keywords, palette } of palettes) {
-        if (keywords.some(kw => text.includes(kw))) {
-            return palette;
-        }
-    }
-
-    // Default palette
-    return {
-        name: 'Elegant Mist',
-        description: 'slate blue (#475569), soft lavender (#C4B5FD), misty rose (#FFE4E6), with platinum highlights',
-        mood: 'Elegant, refined, sophisticated',
-        gradient: ['#475569', '#C4B5FD', '#FFE4E6'],
-    };
-}
-
-function generateSvgCover(title: string): string {
-    const displayTitle = title.length > 18 ? title.slice(0, 18) + '…' : title;
-    const palette = pickColorPalette(title, '');
-    const [c1, c2, c3] = palette.gradient;
-
-    return `<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="511" viewBox="0 0 1200 511">
-  <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" style="stop-color:${c1};stop-opacity:1" />
-      <stop offset="50%" style="stop-color:${c2};stop-opacity:1" />
-      <stop offset="100%" style="stop-color:${c3};stop-opacity:1" />
-    </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" style="stop-color:${c2};stop-opacity:0.3" />
-      <stop offset="100%" style="stop-color:${c3};stop-opacity:0.3" />
-    </linearGradient>
-  </defs>
-  <rect width="1200" height="511" fill="url(#bg)" />
-  <!-- Decorative circles -->
-  <circle cx="900" cy="150" r="120" fill="url(#accent)" opacity="0.4" />
-  <circle cx="150" cy="400" r="80" fill="url(#accent)" opacity="0.3" />
-  <circle cx="1050" cy="420" r="60" fill="${c3}" opacity="0.3" />
-  <!-- Title -->
-  <text x="600" y="240" text-anchor="middle" font-family="'Noto Sans SC', 'Microsoft YaHei', sans-serif" font-size="42" font-weight="700" fill="#FFFFFF" opacity="0.95">${escapeXml(displayTitle)}</text>
-  <!-- Subtitle -->
-  <text x="600" y="295" text-anchor="middle" font-family="'Inter', sans-serif" font-size="16" fill="#FFFFFF" opacity="0.6" letter-spacing="2">WeMedia Auto · 微信公众号</text>
-  <!-- Bottom line -->
-  <rect x="520" y="320" width="160" height="3" rx="1.5" fill="#FFFFFF" opacity="0.4" />
-</svg>`;
-}
-
-function escapeXml(str: string): string {
-    return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function escapeShell(str: string): string {
-    return str.replace(/"/g, '\\"').replace(/\n/g, ' ');
 }

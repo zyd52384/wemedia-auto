@@ -5,6 +5,10 @@ export interface AppSettings {
     geminiBaseUrl: string;
     glmApiKey: string;
     glmBaseUrl: string;
+    // 阿里百炼配置
+    bailianApiKey: string;
+    bailianTextModel: string;    // 文章/小红书生成模型，默认 qwen-plus
+    bailianImageModel: string;   // 封面图片生成模型，默认 wanx-v1
     author: string;
     chromePath: string;
     theme: string;
@@ -21,8 +25,11 @@ const DEFAULTS: AppSettings = {
     geminiBaseUrl: '',
     glmApiKey: '',
     glmBaseUrl: '',
-    author: '我是老朱',
-    chromePath: 'D:\\Program Files\\GptChrome\\GptBrowser.exe',
+    bailianApiKey: '',
+    bailianTextModel: 'qwen-plus',
+    bailianImageModel: 'wanx-v1',
+    author: '我是作者',
+    chromePath: 'D:\\\\Program Files\\\\GptChrome\\\\GptBrowser.exe',
     theme: 'grace',
     writerStyle: 'general',
     publishMethod: 'browser',
@@ -47,6 +54,9 @@ export async function loadSettings(): Promise<AppSettings> {
             geminiBaseUrl: settings.geminiBaseUrl || DEFAULTS.geminiBaseUrl,
             glmApiKey: settings.glmApiKey || DEFAULTS.glmApiKey,
             glmBaseUrl: settings.glmBaseUrl || DEFAULTS.glmBaseUrl,
+            bailianApiKey: settings.bailianApiKey || DEFAULTS.bailianApiKey,
+            bailianTextModel: settings.bailianTextModel || DEFAULTS.bailianTextModel,
+            bailianImageModel: settings.bailianImageModel || DEFAULTS.bailianImageModel,
             author: settings.author || DEFAULTS.author,
             chromePath: settings.chromePath || DEFAULTS.chromePath,
             theme: settings.theme || DEFAULTS.theme,
